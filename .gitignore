@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local indexes and generated retrieval artifacts
+knowledge.index
+knowledge_embeddings.npy
+inverted_index.json
+ragas_outputs/
+ragas_outputs_formal/
+
+# Temporary / helper evaluation assets
+ragas_eval_dataset.sample.json
+ragas_eval_dataset.template.json
+RAGAS_RETRIEVAL_TEMPLATE.md
+
+# Raw source assets not needed for code review
+ocr_text/
+实用临床药物治疗学*.pdf

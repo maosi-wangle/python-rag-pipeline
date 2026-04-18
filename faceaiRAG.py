@@ -236,15 +236,43 @@ class FaceAiSystem:
 
         return sorted(fused_results, key=lambda x: x['score'], reverse=True)[:topk]
 
-    def retrieve_top_contexts(self, query: str, topk: int = 5) -> list[str]:
+    def retrieve_for_ragas(self, query: str, topk: int = 5) -> dict:
+        """
+        返回适合 RAGAS 检索评估的结构化结果。
+        """
         print(f"\n正在为查询 '{query}' 检索 Top {topk} Contexts...")
         if not self.initialized:
             print("系统未初始化，无法检索。")
-            return []
+            return {
+                "user_input": query,
+                "retrieved_contexts": [],
+                "retrieved_context_ids": [],
+                "scores": [],
+                "retrieval_mode": "hybrid_rrf",
+                "topk": topk,
+            }
+
         hybrid_results = self._hybrid_search(query, topk=topk)
-        contexts = [result['text'] for result in hybrid_results]
-        print(f"检索完成，找到 {len(contexts)} 条 Context。")
-        return contexts
+        payload = {
+            "user_input": query,
+            "retrieved_contexts": [result["text"] for result in hybrid_results],
+            "retrieved_context_ids": [int(result["idx"]) for result in hybrid_results],
+            "scores": [float(result["score"]) for result in hybrid_results],
+            "retrieval_mode": "hybrid_rrf",
+            "topk": topk,
+        }
+        print(f"检索完成，找到 {len(payload['retrieved_contexts'])} 条 Context。")
+        return payload
+
+    def batch_retrieve_for_ragas(self, queries: list[str], topk: int = 5) -> list[dict]:
+        """
+        批量返回适合 RAGAS 检索评估的数据结构。
+        """
+        return [self.retrieve_for_ragas(query, topk=topk) for query in queries]
+
+    def retrieve_top_contexts(self, query: str, topk: int = 5) -> list[str]:
+        payload = self.retrieve_for_ragas(query, topk=topk)
+        return payload["retrieved_contexts"]
 
 
 def main():
