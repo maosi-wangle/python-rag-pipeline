@@ -1,130 +1,167 @@
+from __future__ import annotations
+
+import argparse
 import json
-import markdown
-from bs4 import BeautifulSoup, Tag
-from pathlib import Path
 import re
-from typing import List, Dict, Generator
+from pathlib import Path
+
 import jieba
 import jieba.analyse
-import tempfile
-import os
+import markdown
+from bs4 import BeautifulSoup, Tag
 
 
-class FlatMarkdownProcessor:
-    def __init__(self, chunk_size=500):
+class MarkdownKnowledgeBuilder:
+    def __init__(self, chunk_size: int = 500):
         self.chunk_size = chunk_size
-        self._init_regex()
-        self._init_jieba()
-        self.current_chunk = []
-        self.chunks = []
-
-    def _init_regex(self):
-        """初始化正则表达式"""
-        self.keyword_pattern = re.compile(r"【(.*?)】|《(.*?)》")  # 显式关键词匹配
-        self.split_pattern = re.compile(r"[\n。！？]+")  # 分句分隔符
-
-    def _init_jieba(self):
-        """初始化分词组件（修复停用词设置问题）"""
+        self.split_pattern = re.compile(r"[\n。！？；;]")
         jieba.initialize()
 
-        # 创建临时停用词文件
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as f:
-            stopwords = {'的', '了', '和', '是', '就', '都', '而', '及', '与'}
-            f.write('\n'.join(stopwords))
-            temp_path = f.name
+    def build(
+        self,
+        *,
+        file_path: str,
+        document_id: str,
+        title: str | None = None,
+        source: str | None = None,
+    ) -> list[dict]:
+        raw_text = Path(file_path).read_text(encoding="utf-8")
+        html = markdown.markdown(raw_text)
+        soup = BeautifulSoup(html, "html.parser")
 
-        jieba.analyse.set_stop_words(temp_path)
-        os.unlink(temp_path)  # 删除临时文件
+        title = title or self._infer_title(soup, Path(file_path).stem)
+        source = source or file_path
 
-    def _extract_keywords(self, text: str) -> List[str]:
-        """组合式关键词提取"""
-        explicit_kws = list(set(
-            [m for group in self.keyword_pattern.findall(text) for m in group if m]
-        ))
+        current_section = title
+        current_sentences: list[str] = []
+        chunks: list[dict] = []
+        chunk_index = 0
 
-        try:
-            tfidf_kws = jieba.analyse.extract_tags(
-                text,
-                topK=10,
-                allowPOS=('n', 'vn', 'eng')
-            )
-        except Exception:
-            tfidf_kws = []
-
-        return list(set(explicit_kws + tfidf_kws))[:10]
-
-    def _flush_chunk(self):
-        """将当前缓冲区内容生成一个知识块"""
-        if self.current_chunk:
-            full_text = '\n'.join(self.current_chunk)
-            self.chunks.append({
-                "context": full_text,
-                "keywords": self._extract_keywords(full_text)
-            })
-            self.current_chunk = []
-
-    def parse_markdown(self, file_path: str) -> List[Dict]:
-        """解析Markdown生成平铺结构"""
-        try:
-            raw_text = Path(file_path).read_text(encoding='utf-8')
-            html = markdown.markdown(raw_text)
-            soup = BeautifulSoup(html, 'html.parser')
-
-            for element in self._traverse_md_elements(soup):
-                text_content = self._extract_element_text(element)
-
-                # 按分句规则拆分
-                sentences = self.split_pattern.split(text_content.strip())
-
-                for sent in sentences:
-                    if not sent:
-                        continue
-
-                    # 累积到当前块
-                    if len('\n'.join(self.current_chunk + [sent])) > self.chunk_size:
-                        self._flush_chunk()
-                    self.current_chunk.append(sent)
-
-            # 处理最后一块
-            self._flush_chunk()
-            return self.chunks
-
-        except Exception as e:
-            print(f"解析失败: {str(e)}")
-            return []
-
-    def _traverse_md_elements(self, soup) -> Generator[str, None, None]:
-        """遍历有效Markdown元素"""
         for element in soup.descendants:
-            if isinstance(element, Tag) and element.name in ['h1', 'h2', 'h3', 'h4', 'p', 'li']:
-                yield element.get_text().strip()
-            elif isinstance(element, Tag) and element.name == 'hr':
-                yield '---'  # 用分隔符标识段落结束
+            if not isinstance(element, Tag):
+                continue
+            if element.name in {"h1", "h2", "h3", "h4"}:
+                current_section = element.get_text(" ", strip=True) or current_section
+                continue
+            if element.name not in {"p", "li"}:
+                continue
 
-    def _extract_element_text(self, element) -> str:
-        """提取元素文本并添加语义标记"""
-        tag_mapping = {
-            'h1': '# ',
-            'h2': '## ',
-            'h3': '### ',
-            'h4': '#### ',
-            'li': '* '
+            text = element.get_text(" ", strip=True)
+            if not text:
+                continue
+
+            for sentence in self._split_sentences(text):
+                candidate = "\n".join(current_sentences + [sentence])
+                if current_sentences and len(candidate) > self.chunk_size:
+                    chunks.append(
+                        self._make_chunk(
+                            document_id=document_id,
+                            title=title,
+                            section=current_section,
+                            source=source,
+                            chunk_index=chunk_index,
+                            text="\n".join(current_sentences),
+                        )
+                    )
+                    chunk_index += 1
+                    current_sentences = []
+                current_sentences.append(sentence)
+
+        if current_sentences:
+            chunks.append(
+                self._make_chunk(
+                    document_id=document_id,
+                    title=title,
+                    section=current_section,
+                    source=source,
+                    chunk_index=chunk_index,
+                    text="\n".join(current_sentences),
+                )
+            )
+
+        return chunks
+
+    def _infer_title(self, soup: BeautifulSoup, fallback: str) -> str:
+        heading = soup.find(["h1", "h2"])
+        if heading:
+            return heading.get_text(" ", strip=True)
+        return fallback
+
+    def _split_sentences(self, text: str) -> list[str]:
+        sentences = [part.strip() for part in self.split_pattern.split(text) if part.strip()]
+        return sentences or [text.strip()]
+
+    def _make_chunk(
+        self,
+        *,
+        document_id: str,
+        title: str,
+        section: str,
+        source: str,
+        chunk_index: int,
+        text: str,
+    ) -> dict:
+        keywords = jieba.analyse.extract_tags(
+            text,
+            topK=10,
+            allowPOS=("n", "vn", "eng"),
+        )
+        return {
+            "chunk_id": f"{document_id}_chunk_{chunk_index:04d}",
+            "document_id": document_id,
+            "title": title,
+            "section": section,
+            "context": text,
+            "keywords": keywords,
+            "source": source,
+            "metadata": {
+                "builder": "markdown_chunk_processor",
+            },
         }
-        if isinstance(element, str):
-            return element
-        prefix = tag_mapping.get(element.name, '')
-        return f"{prefix}{element.get_text().strip()}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build a future-ready knowledge base JSON from a markdown document."
+    )
+    parser.add_argument("input", help="Path to the markdown file.")
+    parser.add_argument(
+        "--output",
+        default="knowledgeBase.new.json",
+        help="Output JSON path.",
+    )
+    parser.add_argument(
+        "--document-id",
+        required=True,
+        help="Stable document id used for chunk ids.",
+    )
+    parser.add_argument("--title", help="Optional document title override.")
+    parser.add_argument("--source", help="Optional source override.")
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        help="Approximate max characters per chunk.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    builder = MarkdownKnowledgeBuilder(chunk_size=args.chunk_size)
+    chunks = builder.build(
+        file_path=args.input,
+        document_id=args.document_id,
+        title=args.title,
+        source=args.source,
+    )
+    output_path = Path(args.output)
+    output_path.write_text(
+        json.dumps(chunks, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Generated {len(chunks)} chunks -> {output_path}")
 
 
 if __name__ == "__main__":
-    processor = FlatMarkdownProcessor(chunk_size=500)
-    result = processor.parse_markdown("资料.txt")
-
-    if result:
-        with open("平铺知识库.json", "w", encoding='utf-8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        print(f"生成成功，共处理 {len(result)} 个知识块")
-        print("示例片段：")
-        print(json.dumps(result[0], indent=2, ensure_ascii=False)[:500])
-    else:
-        print("未生成有效内容")
+    main()

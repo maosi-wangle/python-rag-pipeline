@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -52,35 +54,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def dump_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 def validate_dataset(samples: list[dict]) -> None:
     if not isinstance(samples, list) or not samples:
-        raise ValueError("评测集必须是非空 list。")
+        raise ValueError("Evaluation dataset must be a non-empty list.")
 
-    required = {"user_input"}
     for idx, sample in enumerate(samples):
         if not isinstance(sample, dict):
-            raise ValueError(f"第 {idx} 条样本不是对象。")
-        missing = [field for field in required if not sample.get(field)]
-        if missing:
-            raise ValueError(f"第 {idx} 条样本缺少字段: {missing}")
+            raise ValueError(f"Sample {idx} is not an object.")
+        if not sample.get("user_input"):
+            raise ValueError(f"Sample {idx} is missing user_input.")
 
 
-def enrich_samples(
-    system: FaceAiSystem,
-    samples: list[dict],
-    topk: int,
-) -> list[dict]:
-    enriched_samples = []
+def enrich_samples(system: FaceAiSystem, samples: list[dict], topk: int) -> list[dict]:
+    enriched_samples: list[dict] = []
     for sample in samples:
         retrieval = system.retrieve_for_ragas(sample["user_input"], topk=topk)
         merged = dict(sample)
@@ -90,7 +86,7 @@ def enrich_samples(
 
 
 def to_ragas_rows(samples: list[dict]) -> list[dict]:
-    rows = []
+    rows: list[dict] = []
     for sample in samples:
         row = {}
         for key, value in sample.items():
@@ -158,11 +154,11 @@ def collect_metrics(samples: list[dict], args: argparse.Namespace):
             ):
                 metric = resolve_metric(metric_name)
                 if metric is None:
-                    skipped.append(f"{metric_name} (当前 ragas 版本未提供)")
+                    skipped.append(f"{metric_name} (not available in this ragas version)")
                     continue
                 metrics.append(metric)
         else:
-            skipped.append("Non-LLM context metrics（缺少 reference_contexts）")
+            skipped.append("Non-LLM context metrics (missing reference_contexts)")
 
     if not args.skip_id_metrics:
         if has_field(samples, "reference_context_ids") and has_field(
@@ -171,15 +167,15 @@ def collect_metrics(samples: list[dict], args: argparse.Namespace):
             for metric_name in ("IDBasedContextPrecision", "IDBasedContextRecall"):
                 metric = resolve_metric(metric_name)
                 if metric is None:
-                    skipped.append(f"{metric_name} (当前 ragas 版本未提供)")
+                    skipped.append(f"{metric_name} (not available in this ragas version)")
                     continue
                 metrics.append(metric)
         else:
-            skipped.append("ID-based metrics（缺少 reference_context_ids）")
+            skipped.append("ID-based metrics (missing reference_context_ids)")
 
     if not metrics:
-        skipped_text = "；".join(skipped) if skipped else "没有可用指标。"
-        raise RuntimeError(f"未能选出任何可执行的 RAGAS 指标：{skipped_text}")
+        skipped_text = "; ".join(skipped) if skipped else "No metrics available."
+        raise RuntimeError(f"Could not resolve any runnable RAGAS metrics: {skipped_text}")
 
     return metrics, skipped
 
@@ -192,7 +188,7 @@ def maybe_export_result_csv(result: Any, output_path: Path) -> None:
         df = result.to_pandas()
         df.to_csv(output_path, index=False, encoding="utf-8-sig")
     except Exception as exc:
-        print(f"跳过 CSV 导出：{exc}")
+        print(f"Skipping CSV export: {exc}")
 
 
 def main() -> None:
@@ -201,35 +197,35 @@ def main() -> None:
     output_dir = Path(args.output_dir)
 
     if not dataset_path.exists():
-        raise FileNotFoundError(f"未找到评测集文件：{dataset_path}")
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     try:
         from ragas import evaluate  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "未安装 ragas。请先执行 `pip install -r requirements-ragas.txt`。"
+            "ragas is not installed. Run `python -m pip install -r requirements-ragas.txt` first."
         ) from exc
 
     raw_samples = load_json(dataset_path)
     validate_dataset(raw_samples)
 
-    print("初始化检索系统...")
+    print("Initializing retrieval system...")
     system = FaceAiSystem()
     if not system.initialized:
-        raise RuntimeError("FaceAiSystem 初始化失败，无法执行 RAGAS 评估。")
+        raise RuntimeError("FaceAiSystem failed to initialize.")
 
-    print("生成 RAGAS 结构化检索输出...")
+    print("Generating structured retrieval payloads for RAGAS...")
     enriched_samples = enrich_samples(system, raw_samples, topk=args.topk)
     enriched_path = output_dir / "retrieval_enriched.json"
     dump_json(enriched_path, enriched_samples)
-    print(f"已导出结构化检索结果：{enriched_path}")
+    print(f"Saved enriched retrieval payloads to: {enriched_path}")
 
     metrics, skipped = collect_metrics(enriched_samples, args)
-    print("本次执行的指标：")
+    print("Metrics to run:")
     for metric in metrics:
         print(f"  - {metric.name}")
     if skipped:
-        print("跳过的指标：")
+        print("Skipped metrics:")
         for item in skipped:
             print(f"  - {item}")
 
@@ -238,9 +234,9 @@ def main() -> None:
 
     from ragas import evaluate
 
-    print("开始执行 RAGAS 评估...")
+    print("Running RAGAS evaluation...")
     result = evaluate(dataset=ragas_dataset, metrics=metrics)
-    print("\nRAGAS 结果汇总：")
+    print("\nRAGAS summary:")
     print(result)
 
     maybe_export_result_csv(result, output_dir / "ragas_result.csv")
