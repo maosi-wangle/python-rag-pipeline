@@ -37,6 +37,7 @@ class AnswerJudgeTool:
 
         if not hits:
             return JudgeResult(
+                grounded=False,
                 completeness="no",
                 relevance_score=0.0,
                 support_score=0.0,
@@ -67,6 +68,7 @@ class AnswerJudgeTool:
             next_query = self._build_followup_query(query, missing_aspects)
 
         return JudgeResult(
+            grounded=bool(hits),
             completeness=completeness,
             relevance_score=coverage_ratio,
             support_score=support_score,
@@ -108,6 +110,7 @@ Retrieved chunk preview:
 
 Return JSON:
 {{
+  "grounded": true,
   "completeness": "yes or no",
   "relevance_score": 0.0,
   "support_score": 0.0,
@@ -133,6 +136,7 @@ Rules:
         if next_query is not None:
             next_query = str(next_query).strip() or None
         return JudgeResult(
+            grounded=bool(payload.get("grounded", True if hits else False)),
             completeness=completeness,
             relevance_score=float(payload.get("relevance_score", 0.0)),
             support_score=float(payload.get("support_score", 0.0)),

@@ -1,68 +1,210 @@
-# Agentic Modular Self-RAG
+# Agentic Modular RAG
 
-一个面向中文知识库的 Python RAG 项目，现已支持：
+这个项目现在的主架构已经切到“单主 agent + tool-calling loop”模式。
 
-- modular RAG 组件化检索
-- agentic query planning
-- self-RAG 多轮检索闭环
-- 并行多路检索：`semantic + keyword + grep`
-- 并行 rerank：`Cohere rerank`，无 key 时自动 fallback
-- 结构化输出：`response / query / retrieved_chunk_ids / completeness / next_query / traces`
-- RAGAS 检索评测兼容
+核心思想不是再包一层显式的 `self_rag for` 去驱动每一轮，而是：
 
-## 目录
+1. 主 agent 自己判断要不要先改写 / 拆分 query。
+2. `retrieve` 工具固定执行并行多路检索。
+3. `retrieve` 内部固定执行 `wait-all -> RRF -> final rerank`。
+4. `generate` 工具固定只做基于证据的生成或重生成。
+5. 主 agent 在拿到答案后自己决定下一步是：
+   - 再检索
+   - 重新生成
+   - `finish`
+
+## Canonical Flow
+
+```text
+user query
+-> main agent tool loop
+   -> optional query_transform
+   -> retrieve
+   -> generate
+   -> agent self-evaluate
+      -> retrieve again
+      -> or generate again
+      -> or finish
+-> structured response
+```
+
+## Current Architecture
+
+### 1. Main Agent
+
+- 文件：[rag/agent.py](/c:/project/python-rag-pipeline/rag/agent.py)
+- 职责：维护 message history、注册 tool schema、执行 tool loop、在 `finish` 时返回最终结构化结果。
+
+### 2. Deterministic Retrieval / Generation Layer
+
+- 文件：[rag/tools/retrieve.py](/c:/project/python-rag-pipeline/rag/tools/retrieve.py)
+- 文件：[rag/tools/answer.py](/c:/project/python-rag-pipeline/rag/tools/answer.py)
+
+`retrieve` 内部流程固定：
+
+```text
+multi-route retrieval in parallel
+-> wait until all retrieval tasks complete
+-> merge / dedup
+-> RRF
+-> final rerank
+-> return retrieval_id + evidence preview
+```
+
+`generate` 内部流程固定：
+
+```text
+query + retrieval_id + optional instruction
+-> load evidence from retrieval memory
+-> grounded answer generation
+-> return answer draft
+```
+
+### 3. Query Transformation Layer
+
+- 文件：[rag/tools/rewrite.py](/c:/project/python-rag-pipeline/rag/tools/rewrite.py)
+
+支持：
+
+- contextualize
+- specific rewrite
+- general rewrite
+- chunk-like rewrite
+- decomposition
+
+输出统一为：
+
+```json
+{
+  "queries": ["..."],
+  "plans": [
+    {
+      "query": "...",
+      "retrieval_modes": ["semantic", "keyword", "grep"]
+    }
+  ]
+}
+```
+
+### 4. Finish Layer
+
+- 文件：[rag/tools/finish.py](/c:/project/python-rag-pipeline/rag/tools/finish.py)
+
+`finish` 是唯一真正的结束信号。
+
+它接收：
+
+- `response`
+- `query`
+- `grounded`
+- `completeness`
+- `if_multi_turn`
+- `rationale`
+- `next_focus`
+- `retrieval_id`
+
+注意：`if_multi_turn` 现在只是最终诊断字段，不再驱动主循环控制。
+
+### 5. Component Container
+
+- 文件：[rag/orchestrator.py](/c:/project/python-rag-pipeline/rag/orchestrator.py)
+
+现在的 `orchestrator` 不再负责旧式多轮控制，而是负责组装：
+
+- knowledge base
+- retrievers
+- reranker
+- query transform tool
+- retrieve tool
+- generate tool
+- finish tool
+
+## Retrieval Strategy
+
+当前默认支持三路：
+
+- `semantic`
+- `keyword`
+- `grep`
+
+说明：
+
+- `keyword` 沿用现有关键词检索，不额外改成 BM25。
+- 多路检索是并行发起的。
+- 最终不是“先重排再 RRF”，而是“先 RRF，再 final rerank”。
+
+## Structured Output
+
+`run_agentic_query()` 当前返回：
+
+```json
+{
+  "response": "最终回答",
+  "query": "最终回答对应的问题",
+  "grounded": true,
+  "retrieved_chunk_ids": ["chunk_001", "chunk_019"],
+  "completeness": "yes",
+  "rationale": "为什么现在可以结束",
+  "next_focus": null,
+  "if_multi_turn": false,
+  "tool_rounds": 3,
+  "used_queries": ["原始 query", "补充 query"],
+  "traces": []
+}
+```
+
+字段含义：
+
+- `grounded`：答案是否被召回证据支撑。
+- `completeness`：答案是否已经覆盖用户问题。
+- `if_multi_turn`：如果此时被迫停止，是否仍然建议继续一轮。
+- `rationale`：为什么结束。
+- `next_focus`：若还值得继续，下一轮最应该补什么。
+
+## Entry Points
 
 - [faceaiRAG.py](/c:/project/python-rag-pipeline/faceaiRAG.py)
-  - 兼容入口，保留 `FaceAiSystem`
+  - 兼容入口
 - [agentic_rag_cli.py](/c:/project/python-rag-pipeline/agentic_rag_cli.py)
-  - 命令行入口
-- [rag](/c:/project/python-rag-pipeline/rag)
-  - 新的 modular / agentic / self-RAG 核心包
-- [markdown_chunk_processor.py](/c:/project/python-rag-pipeline/markdown_chunk_processor.py)
-  - 新知识库构建脚本
-- [eval_ragas.py](/c:/project/python-rag-pipeline/eval_ragas.py)
-  - RAGAS 检索评测脚本
-- [AGENTIC_RAG_PLAN.md](/c:/project/python-rag-pipeline/AGENTIC_RAG_PLAN.md)
-  - 设计说明
+  - CLI 入口
 
-## 检索架构
+## Run
 
-### 1. Modular Retrieval
+### 1. Install
 
-- `SemanticRetriever`
-  - 使用 `sentence-transformers + faiss`
-- `KeywordRetriever`
-  - 保留现有关键词倒排检索思路
-- `GrepRetriever`
-  - 做短语/实体/精确文本补充召回
-- `Fusion`
-  - 使用 RRF 合并结果
+```powershell
+python -m pip install -r requirements.txt
+```
 
-### 2. Agentic Planning
+### 2. Set Env
 
-- `QueryPlannerTool`
-  - 决定是否改写 query
-  - 决定是否拆 subquery
-  - 决定要调用哪些 retriever
-- `QueryRewriteTool`
-  - 做 chunk-like / contextual rewrite
-- `QueryDecomposeTool`
-  - 做多意图问题拆解
+LLM:
 
-### 3. Self-RAG Loop
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- optional `OPENAI_BASE_URL`
 
-流程如下：
+Rerank:
 
-1. 基于上下文记忆规划 query
-2. 并行执行多路检索
-3. 按 query group 并行 rerank
-4. 生成 grounded answer
-5. 自评 `relevance / support / completeness`
-6. 若 `completeness = no`，生成下一轮 query 继续检索
+- `COHERE_API_KEY`
+- optional `COHERE_RERANK_MODEL`
+- optional `COHERE_RERANK_URL`
 
-## 新知识库格式
+### 3. CLI
 
-后续知识库请统一使用以下 schema：
+```powershell
+python agentic_rag_cli.py --query "防晒需要注意什么" --topk 5 --max-rounds 4 --print-traces
+```
+
+### 4. Interactive
+
+```powershell
+python agentic_rag_cli.py --interactive --topk 5 --max-rounds 4 --print-traces
+```
+
+## Knowledge Format
+
+后续知识库建议统一使用：
 
 ```json
 {
@@ -72,101 +214,20 @@
   "section": "章节名",
   "context": "chunk 正文",
   "keywords": ["关键词1", "关键词2"],
-  "source": "来源路径或 URL",
+  "source": "source path or url",
   "metadata": {
     "lang": "zh"
   }
 }
 ```
 
-旧 `knowledgeBase.json` 仍可兼容读取，但建议只作为过渡数据。
+旧格式仍然兼容读取，但已经不再是推荐主格式。
 
-## 安装
+## Detailed Explanation
 
-```powershell
-python -m pip install -r requirements.txt
-```
+更详细的架构、模块逻辑、代码逻辑说明见：
 
-## 环境变量
-
-### OpenAI-compatible LLM
-
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- 可选 `OPENAI_BASE_URL`
-- 可选 `OPENAI_TIMEOUT`
-- 可选 `OPENAI_TEMPERATURE`
-
-用途：
-
-- query planning
-- grounded answer generation
-- self-judge
-
-未配置时，系统会回退到启发式 planner / generator / judge。
-
-### Cohere Rerank
-
-- `COHERE_API_KEY`
-- 可选 `COHERE_RERANK_MODEL`
-- 可选 `COHERE_RERANK_URL`
-
-未配置时，系统会回退到 lexical overlap rerank。
-
-## 运行
-
-### 1. 交互式 Agentic RAG
-
-```powershell
-python agentic_rag_cli.py --interactive --topk 5 --max-rounds 3 --print-traces
-```
-
-### 2. 单次查询
-
-```powershell
-python agentic_rag_cli.py --query "防晒需要注意什么" --topk 5 --max-rounds 3 --print-traces
-```
-
-### 3. 兼容旧入口
-
-```powershell
-python faceaiRAG.py
-```
-
-### 4. 构建新知识库
-
-```powershell
-python markdown_chunk_processor.py docs/example.md --document-id doc_001 --output knowledgeBase.new.json
-```
-
-### 5. RAGAS 检索评测
-
-```powershell
-python eval_ragas.py --dataset ragas_eval_dataset.formal.json --topk 5 --output-dir ragas_outputs_formal
-```
-
-## 结构化输出
-
-`run_agentic_query()` 输出格式：
-
-```json
-{
-  "response": "最终回答",
-  "query": "本轮实际检索 query",
-  "retrieved_chunk_ids": ["doc_001_chunk_0001", "doc_001_chunk_0007"],
-  "completeness": "yes",
-  "relevance_score": 0.88,
-  "support_score": 0.81,
-  "need_followup": false,
-  "next_query": null,
-  "round": 1,
-  "traces": []
-}
-```
-
-## 当前状态
-
-这版项目已经具备完整的 agentic / modular / self-RAG 基础链路
-
-- 如果没有配置 LLM 和 Cohere key，系统仍然可跑，但 planning / answer / judge / rerank 会使用 fallback 逻辑，效果会弱于完整线上配置。
-- 回答生成目前是“grounded first”的工程取向，优先保证可追踪和可扩展
+- [PHASE0_BASELINE.md](/c:/project/python-rag-pipeline/PHASE0_BASELINE.md)
+- [PROJECT_EXPLANATION.md](/c:/project/python-rag-pipeline/PROJECT_EXPLANATION.md)
+- [AGENTIC_RAG_PLAN.md](/c:/project/python-rag-pipeline/AGENTIC_RAG_PLAN.md)
+- [PLATFORMIZATION_PLAN.md](/c:/project/python-rag-pipeline/PLATFORMIZATION_PLAN.md)

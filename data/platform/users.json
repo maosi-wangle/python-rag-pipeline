@@ -1,0 +1,22 @@
+[
+  {
+    "user_id": "default",
+    "display_name": "Default User",
+    "default_chat_profile_id": "default",
+    "permissions": [
+      "rag:query"
+    ],
+    "metadata": {}
+  },
+  {
+    "user_id": "qlw",
+    "display_name": "qlw",
+    "default_chat_profile_id": "qlw_chat",
+    "default_embedding_profile_id": null,
+    "default_rerank_profile_id": null,
+    "permissions": [
+      "rag:query"
+    ],
+    "metadata": {}
+  }
+]

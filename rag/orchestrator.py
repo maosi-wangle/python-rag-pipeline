@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 from .config import RAGConfig
 from .knowledge_base import ChunkStore
 from .llm import LLMClient
-from .retrievers import GrepRetriever, KeywordRetriever, SemanticRetriever, reciprocal_rank_fusion
-from .schemas import RetrievalHit, RetrievalResult
-from .state import RetrievalRoundState
-from .text_utils import normalize_whitespace, unique_preserve_order
-from .tools import (
-    AnswerGenerationTool,
-    AnswerJudgeTool,
-    CohereRerankTool,
-    QueryDecomposeTool,
-    QueryPlannerTool,
-    QueryRewriteTool,
-)
+from .retrievers import GrepRetriever, KeywordRetriever, SemanticRetriever
+from .text_utils import normalize_whitespace
+from .tools.answer import AnswerGenerationTool
+from .tools.finish import FinishTool
+from .tools.judge import AnswerJudgeTool
+from .tools.rerank import CohereRerankTool
+from .tools.retrieve import RetrievalTool
+from .tools.rewrite import QueryRewriteTool
 
 
 class ModularRAGOrchestrator:
@@ -32,13 +28,58 @@ class ModularRAGOrchestrator:
             "keyword": self.keyword_retriever,
             "grep": self.grep_retriever,
         }
-        self.query_rewriter = QueryRewriteTool()
-        self.query_decomposer = QueryDecomposeTool()
-        self.query_planner = QueryPlannerTool(self.llm)
         self.reranker = CohereRerankTool(self.config)
+        self.query_transform_tool = QueryRewriteTool(self.llm)
+        self.retrieve_tool = RetrievalTool(
+            retriever_map=self.retriever_map,
+            reranker=self.reranker,
+            config=self.config,
+        )
         self.answer_generator = AnswerGenerationTool(self.llm)
         self.answer_judge = AnswerJudgeTool(self.llm)
+        self.finish_tool = FinishTool()
         self.initialized = bool(self.chunk_store.chunks)
+
+    def default_retrieval_modes(self, query: str) -> list[str]:
+        normalized_query = normalize_whitespace(query)
+        modes = ["semantic", "keyword"]
+        if len(normalized_query) <= 24 or any(
+            token in normalized_query for token in ("定义", "命令", "参数", "路径", "配置")
+        ):
+            modes.append("grep")
+        return modes
+
+    def retrieve_once(
+        self,
+        query: str,
+        *,
+        plans: list[dict[str, object]] | None = None,
+        retrieval_modes: list[str] | None = None,
+        topk: int | None = None,
+    ) -> dict[str, Any]:
+        return self.retrieve_tool.run(
+            query=query,
+            plans=plans,
+            retrieval_modes=retrieval_modes,
+            topk=topk,
+        )
+
+    def generate_once(
+        self,
+        *,
+        query: str,
+        hits: list,
+        history: list[str] | None = None,
+        instruction: str | None = None,
+        source_mode: str = "retrieval",
+    ):
+        return self.answer_generator.generate(
+            query=query,
+            hits=hits,
+            history=history or [],
+            instruction=instruction,
+            source_mode=source_mode,
+        )
 
     def build_ragas_payload(
         self,
@@ -47,156 +88,21 @@ class ModularRAGOrchestrator:
         topk: int | None = None,
         history: list[str] | None = None,
     ) -> dict[str, object]:
-        round_state = self.run_round(
+        retrieval = self.retrieve_once(
             query,
-            history=history,
+            retrieval_modes=self.default_retrieval_modes(query),
             topk=topk or self.config.default_topk,
-            round_index=1,
-            max_rounds=1,
         )
+        final_hits = list(retrieval["fused_hits"])
         return {
             "user_input": query,
-            "retrieved_contexts": [hit.text for hit in round_state.fused_hits],
+            "retrieved_contexts": [hit.text for hit in final_hits],
             "retrieved_context_ids": [
                 hit.chunk.legacy_index if hit.chunk.legacy_index is not None else hit.chunk_id
-                for hit in round_state.fused_hits
+                for hit in final_hits
             ],
-            "scores": [hit.final_score() for hit in round_state.fused_hits],
-            "retrieval_mode": "agentic_modular_rrf",
+            "scores": [hit.final_score() for hit in final_hits],
+            "retrieval_mode": "agentic_retrieve_rrf_rerank",
             "topk": topk or self.config.default_topk,
+            "history": history or [],
         }
-
-    def run_round(
-        self,
-        query: str,
-        *,
-        history: list[str] | None = None,
-        topk: int | None = None,
-        round_index: int = 1,
-        max_rounds: int | None = None,
-    ) -> RetrievalRoundState:
-        history = history or []
-        topk = topk or self.config.default_topk
-        active_query = normalize_whitespace(query)
-        plan = self.query_planner.plan(active_query, history)
-        subqueries = self._plan_subqueries(active_query, plan)
-        query_variants = self._plan_query_variants(active_query, history, subqueries, plan)
-        selected_retrievers = plan.get("retrievers") or list(self.retriever_map)
-
-        retrieval_results = self._parallel_retrieve(query_variants, topk, selected_retrievers)
-        query_level_hits = self._parallel_rerank_groups(retrieval_results, topk)
-        final_hits = reciprocal_rank_fusion(
-            [
-                RetrievalResult(query=planned_query, retriever="query_group", hits=hits)
-                for planned_query, hits in query_level_hits.items()
-            ],
-            topk=topk,
-            k=self.config.fusion_k,
-        )
-        answer_draft = self.answer_generator.generate(
-            query=active_query,
-            hits=final_hits,
-            history=history,
-        )
-
-        judge_result = self.answer_judge.judge(
-            query=active_query,
-            response=answer_draft,
-            hits=final_hits,
-            subqueries=subqueries,
-            round_index=round_index,
-            max_rounds=max_rounds or self.config.max_rounds,
-        )
-
-        return RetrievalRoundState(
-            round_index=round_index,
-            input_query=query,
-            active_query=active_query,
-            query_variants=query_variants,
-            subqueries=subqueries,
-            retrieval_results=retrieval_results,
-            query_level_hits=query_level_hits,
-            fused_hits=final_hits,
-            answer_draft=answer_draft,
-            completeness=judge_result.completeness,
-            relevance_score=judge_result.relevance_score,
-            support_score=judge_result.support_score,
-            need_followup=judge_result.need_followup,
-            next_query=judge_result.next_query,
-            missing_aspects=judge_result.missing_aspects,
-            judge_reason=judge_result.reason,
-        )
-
-    def _plan_subqueries(self, query: str, plan: dict[str, object]) -> list[str]:
-        planned = [str(item) for item in plan.get("subqueries", [])]
-        if planned:
-            return unique_preserve_order(planned)[:4]
-        return self.query_decomposer.decompose(query)
-
-    def _plan_query_variants(
-        self,
-        query: str,
-        history: list[str],
-        subqueries: list[str],
-        plan: dict[str, object],
-    ) -> list[str]:
-        planned_rewrites = [str(item) for item in plan.get("rewritten_queries", [])]
-        rewrite_modes: list[str] = ["chunk_like"]
-        if history and len(query) <= 16:
-            rewrite_modes.append("specific")
-        variants = planned_rewrites + self.query_rewriter.rewrite(query, history=history, modes=rewrite_modes)
-        if subqueries:
-            variants.extend(subqueries)
-        return unique_preserve_order(variants)[:6]
-
-    def _parallel_retrieve(
-        self,
-        queries: list[str],
-        topk: int,
-        retriever_names: list[str],
-    ) -> list[RetrievalResult]:
-        candidate_topk = max(topk * 2, 6)
-        future_map = {}
-        results: list[RetrievalResult] = []
-
-        with ThreadPoolExecutor(max_workers=self.config.retrieval_pool_size) as executor:
-            for query in queries:
-                for retriever_name in retriever_names:
-                    retriever = self.retriever_map[retriever_name]
-                    future = executor.submit(retriever.retrieve, query, candidate_topk)
-                    future_map[future] = (query, retriever.name)
-
-            for future in as_completed(future_map):
-                result = future.result()
-                results.append(result)
-
-        return results
-
-    def _parallel_rerank_groups(
-        self,
-        retrieval_results: list[RetrievalResult],
-        topk: int,
-    ) -> dict[str, list[RetrievalHit]]:
-        grouped_results: dict[str, list[RetrievalResult]] = {}
-        for result in retrieval_results:
-            grouped_results.setdefault(result.query, []).append(result)
-
-        query_level_hits: dict[str, list[RetrievalHit]] = {}
-        future_map = {}
-        candidate_limit = max(topk * 3, 8)
-
-        with ThreadPoolExecutor(max_workers=self.config.rerank_pool_size) as executor:
-            for query, results in grouped_results.items():
-                fused_hits = reciprocal_rank_fusion(
-                    results,
-                    topk=candidate_limit,
-                    k=self.config.fusion_k,
-                )
-                future = executor.submit(self.reranker.rerank, query, fused_hits, candidate_limit)
-                future_map[future] = query
-
-            for future in as_completed(future_map):
-                query = future_map[future]
-                query_level_hits[query] = future.result()
-
-        return query_level_hits

@@ -1,0 +1,66 @@
+[
+  {
+    "kb_id": "default",
+    "name": "Default Knowledge Base",
+    "description": "Existing local knowledge files.",
+    "language": "zh",
+    "chunk_store_path": "./knowledgeBase.json",
+    "index_path": "./knowledge.index",
+    "embeddings_path": "./knowledge_embeddings.npy",
+    "inverted_index_path": "./inverted_index.json",
+    "retrieval_modes": [
+      "semantic",
+      "keyword"
+    ],
+    "parser_id": "legacy_json",
+    "parser_config": {},
+    "chunking_config": {},
+    "index_config": {},
+    "status": "ready",
+    "metadata": {
+      "domain": "general",
+      "tags": [
+        "默认",
+        "通用"
+      ],
+      "examples": [],
+      "priority": 0
+    }
+  },
+  {
+    "kb_id": "skin_kb",
+    "name": "Skin Knowledge Base",
+    "description": "Alias for the existing local skin-care knowledge files.",
+    "language": "zh",
+    "chunk_store_path": "./knowledgeBase.json",
+    "index_path": "./knowledge.index",
+    "embeddings_path": "./knowledge_embeddings.npy",
+    "inverted_index_path": "./inverted_index.json",
+    "retrieval_modes": [
+      "semantic",
+      "keyword"
+    ],
+    "parser_id": "legacy_json",
+    "parser_config": {},
+    "chunking_config": {},
+    "index_config": {},
+    "status": "ready",
+    "metadata": {
+      "domain": "skin_care",
+      "tags": [
+        "防晒",
+        "护肤",
+        "皮肤",
+        "美白",
+        "儿童防晒"
+      ],
+      "examples": [
+        "防晒需要注意什么",
+        "儿童怎么防晒",
+        "防晒霜怎么涂",
+        "阴天需要防晒吗"
+      ],
+      "priority": 10
+    }
+  }
+]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
@@ -7,6 +8,20 @@ from typing import Any
 from openai import OpenAI
 
 from .config import RAGConfig
+
+
+@dataclass(slots=True)
+class ToolCallRequest:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ToolChatResponse:
+    content: str
+    tool_calls: list[ToolCallRequest] = field(default_factory=list)
+    assistant_message: dict[str, Any] = field(default_factory=dict)
 
 
 class LLMClient:
@@ -45,6 +60,65 @@ class LLMClient:
             timeout=self.config.openai_timeout,
         )
         return (response.choices[0].message.content or "").strip()
+
+    def chat_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int = 1400,
+        tool_choice: str | dict[str, Any] = "auto",
+    ) -> ToolChatResponse:
+        if not self.available or self.client is None or not self.config.openai_model:
+            raise RuntimeError("LLM client is not configured.")
+
+        response = self.client.chat.completions.create(
+            model=self.config.openai_model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=self.config.openai_temperature if temperature is None else temperature,
+            max_completion_tokens=max_tokens,
+            timeout=self.config.openai_timeout,
+        )
+        message = response.choices[0].message
+        tool_calls: list[ToolCallRequest] = []
+        serialized_tool_calls: list[dict[str, Any]] = []
+
+        for tool_call in message.tool_calls or []:
+            raw_arguments = tool_call.function.arguments or "{}"
+            parsed_arguments = self._parse_json(raw_arguments)
+            tool_calls.append(
+                ToolCallRequest(
+                    id=tool_call.id,
+                    name=tool_call.function.name,
+                    arguments=parsed_arguments,
+                )
+            )
+            serialized_tool_calls.append(
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": json.dumps(parsed_arguments, ensure_ascii=False),
+                    },
+                }
+            )
+
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": (message.content or "").strip(),
+        }
+        if serialized_tool_calls:
+            assistant_message["tool_calls"] = serialized_tool_calls
+
+        return ToolChatResponse(
+            content=(message.content or "").strip(),
+            tool_calls=tool_calls,
+            assistant_message=assistant_message,
+        )
 
     def generate_json(
         self,

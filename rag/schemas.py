@@ -113,6 +113,7 @@ class RetrievalResult:
 
 @dataclass(slots=True)
 class JudgeResult:
+    grounded: bool
     completeness: str
     relevance_score: float
     support_score: float
@@ -126,25 +127,36 @@ class JudgeResult:
 class StructuredRAGResponse:
     response: str
     query: str
+    grounded: bool
     retrieved_chunk_ids: list[str]
     completeness: str
-    relevance_score: float
-    support_score: float
-    need_followup: bool
-    next_query: str | None
-    round: int
+    if_multi_turn: bool
+    rationale: str = ""
+    next_focus: str | None = None
+    relevance_score: float = 0.0
+    support_score: float = 0.0
+    next_query: str | None = None
+    round: int = 1
+    tool_rounds: int = 0
+    used_queries: list[str] = field(default_factory=list)
     traces: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "response": self.response,
             "query": self.query,
+            "grounded": self.grounded,
             "retrieved_chunk_ids": self.retrieved_chunk_ids,
             "completeness": self.completeness,
+            "rationale": self.rationale,
+            "next_focus": self.next_focus,
             "relevance_score": self.relevance_score,
             "support_score": self.support_score,
-            "need_followup": self.need_followup,
+            "if_multi_turn": self.if_multi_turn,
+            "need_followup": self.if_multi_turn,
             "next_query": self.next_query,
             "round": self.round,
+            "tool_rounds": self.tool_rounds,
+            "used_queries": self.used_queries,
             "traces": self.traces,
         }

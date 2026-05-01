@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from rag import ModularRAGOrchestrator, RAGConfig, SelfRAGPipeline
+from rag import ModularRAGOrchestrator, RAGConfig, ToolCallingRAGAgent
 
 
 class FaceAiSystem:
@@ -13,15 +13,16 @@ class FaceAiSystem:
         index_path: str = "./knowledge.index",
         embeddings_path: str = "./knowledge_embeddings.npy",
         inverted_index_path: str = "./inverted_index.json",
+        config: RAGConfig | None = None,
     ):
-        self.config = RAGConfig(
+        self.config = config or RAGConfig(
             data_path=dataPath,
             index_path=index_path,
             embeddings_path=embeddings_path,
             inverted_index_path=inverted_index_path,
         )
         self.orchestrator = ModularRAGOrchestrator(self.config)
-        self.self_rag = SelfRAGPipeline(self.orchestrator, self.config)
+        self.agent = ToolCallingRAGAgent(self.orchestrator, self.config)
         self.initialized = self.orchestrator.initialized
 
     def retrieve_for_ragas(self, query: str, topk: int = 5) -> dict[str, Any]:
@@ -42,7 +43,7 @@ class FaceAiSystem:
         topk: int = 5,
         max_rounds: int | None = None,
     ) -> dict[str, Any]:
-        return self.self_rag.run(
+        return self.agent.run(
             query,
             history=history,
             topk=topk,
