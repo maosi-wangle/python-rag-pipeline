@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from rag import ModularRAGOrchestrator, RAGConfig, ToolCallingRAGAgent
+from rag.input import MultimodalInputParser
 
 
 class FaceAiSystem:
@@ -24,6 +25,7 @@ class FaceAiSystem:
         self.orchestrator = ModularRAGOrchestrator(self.config)
         self.agent = ToolCallingRAGAgent(self.orchestrator, self.config)
         self.initialized = self.orchestrator.initialized
+        self.input_parser = MultimodalInputParser()
 
     def retrieve_for_ragas(self, query: str, topk: int = 5) -> dict[str, Any]:
         return self.orchestrator.build_ragas_payload(query, topk=topk)
@@ -42,7 +44,12 @@ class FaceAiSystem:
         history: list[str] | None = None,
         topk: int = 5,
         max_rounds: int | None = None,
+        input_file: str | None = None,
     ) -> dict[str, Any]:
+        parsed_message = None
+        if input_file:
+            parsed_message = self.input_parser.parse_file(input_file, persist=False)
+            query = self.input_parser.build_query_context(query, parsed_message)
         return self.agent.run(
             query,
             history=history,

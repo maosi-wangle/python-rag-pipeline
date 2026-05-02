@@ -4,6 +4,8 @@ import json
 from typing import Any
 
 from .config import RAGConfig
+from .mcp.runtime import MCPRuntime
+from .mcp.schemas import MCPToolSpec
 from .orchestrator import ModularRAGOrchestrator
 from .platform.kb_catalog import KnowledgeBaseCatalogItem, build_catalog_prompt
 from .prompts import AGENT_SYSTEM_PROMPT
@@ -21,6 +23,8 @@ class ToolCallingRAGAgent:
         orchestrators_by_kb: dict[str, ModularRAGOrchestrator] | None = None,
         available_kbs: list[dict[str, Any]] | None = None,
         default_kb_ids: list[str] | None = None,
+        mcp_tools: list[MCPToolSpec] | None = None,
+        mcp_runtime: MCPRuntime | None = None,
     ):
         self.config = config or RAGConfig()
         self.orchestrator = orchestrator or ModularRAGOrchestrator(self.config)
@@ -35,6 +39,8 @@ class ToolCallingRAGAgent:
         self.messages: list[dict[str, Any]] = []
         self.runtime = RuntimeStore()
         self.traces: list[dict[str, Any]] = []
+        self.mcp_tools = [tool for tool in list(mcp_tools or []) if tool.enabled]
+        self.mcp_runtime = mcp_runtime
 
     def run(
         self,
@@ -146,6 +152,19 @@ class ToolCallingRAGAgent:
             f"- 调用 retrieve 时，请从可用知识库中选择 kb_ids；如果不确定，可选择多个；不要选择未列出的 kb_id。\n"
             f"- 每次生成答案草稿后，判断是继续检索、重新生成，还是 finish。\n"
         )
+        if self.mcp_tools:
+            mcp_tool_lines = "\n".join(
+                f"- {tool.function_name}: {tool.description}"
+                for tool in self.mcp_tools
+            )
+            user_message += (
+                "\n\nAvailable MCP tools:\n"
+                f"{mcp_tool_lines}\n\n"
+                "MCP usage policy:\n"
+                "- Prefer local retrieve first for knowledge-base questions.\n"
+                "- Use web-search MCP tools when local retrieval is empty, weak, unavailable, or the user asks for current web information.\n"
+                "- If an MCP tool returns retrieval_id, call generate with that retrieval_id before finish.\n"
+            )
         return [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
@@ -153,7 +172,7 @@ class ToolCallingRAGAgent:
 
     def _tool_schemas(self) -> list[dict[str, Any]]:
         decision_schema = self._decision_schema()
-        return [
+        tools = [
             {
                 "type": "function",
                 "function": {
@@ -270,6 +289,8 @@ class ToolCallingRAGAgent:
                 },
             },
         ]
+        tools.extend(tool.to_openai_tool() for tool in self.mcp_tools)
+        return tools
 
     def _decision_schema(self) -> dict[str, Any]:
         return {
@@ -345,7 +366,23 @@ class ToolCallingRAGAgent:
             return self._execute_generate(arguments, history)
         if tool_name == "finish":
             return self._execute_finish(arguments)
+        if self.mcp_runtime and self.mcp_runtime.has_tool(tool_name):
+            return self._execute_mcp_tool(tool_name, arguments)
         return {"error": f"Unknown tool: {tool_name}"}
+
+    def _execute_mcp_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self.mcp_runtime:
+            return {"error": "MCP runtime is not configured.", "mcp_tool": tool_name}
+        result = self.mcp_runtime.call_tool(tool_name, arguments)
+        retrieval = result.pop("retrieval", None)
+        if retrieval:
+            retrieval_id = self.runtime.put_retrieval(retrieval)
+            hits = list(retrieval.get("fused_hits", []))
+            result["retrieval_id"] = retrieval_id
+            result["retrieved_chunk_ids"] = [hit.chunk_id for hit in hits]
+            result["used_queries"] = list(retrieval.get("used_queries", []))
+            result["retrieval_budget"] = dict(retrieval.get("retrieval_budget", {}))
+        return result
 
     def _execute_retrieve(self, arguments: dict[str, Any], default_topk: int) -> dict[str, Any]:
         selected_kb_ids = self._effective_kb_ids(arguments.get("kb_ids"))

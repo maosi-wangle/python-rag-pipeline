@@ -10,7 +10,7 @@ from rag.platform.service import AgenticRAGService
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the tool-calling agentic modular RAG pipeline.")
+    parser = argparse.ArgumentParser(description="Run AstraRAG, the tool-calling agentic RAG platform.")
     parser.add_argument("--query", help="Single query to run.")
     parser.add_argument(
         "--history-file",
@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--print-traces", action="store_true")
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--file", help="Optional input file to parse and attach to the query.")
     parser.add_argument("--platform-root", help="Directory containing platform JSON config files.")
     parser.add_argument("--user", help="Platform user profile id.")
     parser.add_argument("--kb", action="append", help="Platform knowledge base id. Can be repeated or comma-separated.")
@@ -75,6 +76,7 @@ def run_once(system: FaceAiSystem, query: str, history: list[str], args: argpars
         history=history,
         topk=args.topk,
         max_rounds=args.max_rounds,
+        input_file=args.file,
     )
     print_result(result, args)
 
@@ -94,6 +96,7 @@ def run_once_platform(
         history=history,
         topk=args.topk,
         max_rounds=args.max_rounds,
+        input_file=args.file,
     )
     print_result(result, args)
 

@@ -8,6 +8,11 @@ from uuid import uuid4
 
 from ..agent import ToolCallingRAGAgent
 from ..config import RAGConfig
+from ..input import MultimodalInputParser
+from ..input.parser import build_query_with_artifacts
+from ..mcp.discovery import MCPDiscoveryService, parse_enabled_tools
+from ..mcp.runtime import MCPRuntime
+from ..mcp.session import MCPSessionManager
 from ..orchestrator import ModularRAGOrchestrator
 from .repositories import PlatformRepository
 from .kb_catalog import KnowledgeBaseCatalogItem
@@ -31,6 +36,9 @@ class AgenticRAGService:
         self.repository = repository or PlatformRepository()
         self.repository.ensure_defaults()
         self.base_config = base_config or RAGConfig()
+        self.input_parser = MultimodalInputParser()
+        self.mcp_session_manager = MCPSessionManager()
+        self.mcp_discovery = MCPDiscoveryService(self.mcp_session_manager)
 
     def answer(
         self,
@@ -43,6 +51,7 @@ class AgenticRAGService:
         history: list[str] | None = None,
         topk: int | None = None,
         max_rounds: int | None = None,
+        input_file: str | None = None,
     ) -> dict[str, Any]:
         started_at = self._now()
         trace_id = f"trace_{uuid4().hex[:12]}"
@@ -81,16 +90,44 @@ class AgenticRAGService:
             for profile in kb_profiles
         ]
         orchestrator = orchestrators_by_kb[kb_profile.kb_id]
+        mcp_servers, mcp_tools = self._resolve_mcp_tools(chat_profile)
+        mcp_runtime = MCPRuntime(
+            servers=mcp_servers,
+            tools=mcp_tools,
+            session_manager=self.mcp_session_manager,
+        ) if mcp_tools else None
         agent = ToolCallingRAGAgent(
             orchestrator,
             config,
             orchestrators_by_kb=orchestrators_by_kb,
             available_kbs=[item.to_dict() for item in catalog_items],
             default_kb_ids=[profile.kb_id for profile in kb_profiles],
+            mcp_tools=mcp_tools,
+            mcp_runtime=mcp_runtime,
         )
         combined_history = self._conversation_history(conversation) + list(history or [])
+        artifact = None
+        artifact_ids = self._conversation_artifact_ids(conversation)
+        if input_file:
+            parsed_message = self.input_parser.parse_file(
+                input_file,
+                owner_user_id=user.user_id,
+                conversation_id=conversation.conversation_id if conversation_id else None,
+                persist=bool(conversation_id),
+            )
+            artifact = parsed_message.artifacts[0]
+            if conversation_id:
+                self.repository.artifacts.upsert(artifact)
+                artifact_ids = self._merge_artifact_ids(artifact_ids, [artifact.artifact_id])
+        artifacts = self.repository.artifacts.get_many(artifact_ids) if artifact_ids else []
+        if artifact is not None:
+            artifacts = [item for item in artifacts if item.artifact_id != artifact.artifact_id] + [artifact]
+        if conversation_id and artifacts:
+            self._remember_artifacts(conversation, artifacts, artifact)
+            self.repository.conversations.upsert(conversation)
+        effective_query = build_query_with_artifacts(query, artifacts) if artifacts else query
         response = agent.run(
-            query,
+            effective_query,
             history=combined_history,
             topk=topk or chat_profile.default_topk or kb_profile.default_topk,
             max_rounds=max_rounds or chat_profile.max_rounds,
@@ -103,6 +140,8 @@ class AgenticRAGService:
             kb_ids=active_kb_ids,
             chat_profile_id=chat_profile.profile_id,
             trace_id=trace_id,
+            artifacts=artifacts,
+            latest_artifact=artifact,
         )
         if conversation_id:
             self.repository.conversations.upsert(conversation)
@@ -123,6 +162,9 @@ class AgenticRAGService:
                 "llm_profile_id": llm_profile.profile_id if llm_profile else None,
                 "primary_kb_id": kb_profile.kb_id,
                 "available_kbs": [item.to_dict() for item in catalog_items],
+                "artifact_ids": [item.artifact_id for item in artifacts],
+                "mcp_servers": [server.server_id for server in mcp_servers],
+                "mcp_tools": [tool.function_name for tool in mcp_tools],
                 "result": {
                     key: value
                     for key, value in response.items()
@@ -141,6 +183,9 @@ class AgenticRAGService:
             "available_kb_ids": [profile.kb_id for profile in kb_profiles],
             "chat_profile_id": chat_profile.profile_id,
             "llm_profile_id": llm_profile.profile_id if llm_profile else None,
+            "artifact_ids": [item.artifact_id for item in artifacts],
+            "mcp_servers": [server.server_id for server in mcp_servers],
+            "mcp_tools": [tool.function_name for tool in mcp_tools],
         }
         return response
 
@@ -245,6 +290,38 @@ class AgenticRAGService:
                 allowed.add(str(value))
         return allowed
 
+    def _resolve_mcp_tools(self, chat_profile: ChatProfile) -> tuple[list[Any], list[Any]]:
+        metadata = chat_profile.metadata or {}
+        if metadata.get("mcp_enabled") is False:
+            return [], []
+        all_servers = [server for server in self.repository.mcp_servers.all() if server.enabled]
+        if not all_servers:
+            return [], []
+        enabled_server_ids = metadata.get("enabled_mcp_servers")
+        if isinstance(enabled_server_ids, str):
+            enabled_server_ids = [enabled_server_ids]
+        if not isinstance(enabled_server_ids, list):
+            enabled_server_ids = [server.server_id for server in all_servers]
+        enabled_server_ids = [str(item) for item in enabled_server_ids]
+        servers = [server for server in all_servers if server.server_id in enabled_server_ids]
+
+        refreshed_servers = []
+        for server in servers:
+            active = server
+            if not active.tool_cache:
+                active = self.mcp_discovery.refresh_server(active)
+                self.repository.mcp_servers.upsert(active)
+            refreshed_servers.append(active)
+
+        enabled_tools = parse_enabled_tools(metadata.get("enabled_mcp_tools"))
+        tools = self.mcp_discovery.tool_specs(
+            refreshed_servers,
+            enabled_server_ids=enabled_server_ids,
+            enabled_tools=enabled_tools,
+            refresh_empty=False,
+        )
+        return refreshed_servers, tools
+
     def _get_llm_profile(self, chat_profile: ChatProfile) -> LLMProfile | None:
         if not chat_profile.chat_llm_profile_id:
             return None
@@ -328,10 +405,13 @@ class AgenticRAGService:
         kb_ids: list[str],
         chat_profile_id: str,
         trace_id: str,
+        artifacts: list[Any],
+        latest_artifact: Any,
     ) -> None:
         now = self._now()
         conversation.active_kb_ids = list(kb_ids)
         conversation.chat_profile_id = chat_profile_id
+        self._remember_artifacts(conversation, artifacts, latest_artifact)
         conversation.messages.append(
             {
                 "role": "user",
@@ -352,3 +432,38 @@ class AgenticRAGService:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _conversation_artifact_ids(conversation: ConversationSession) -> list[str]:
+        metadata = conversation.metadata or {}
+        artifact_ids = metadata.get("active_artifact_ids") or metadata.get("artifact_ids") or []
+        if isinstance(artifact_ids, list):
+            return [str(item) for item in artifact_ids]
+        if artifact_ids:
+            return [str(artifact_ids)]
+        return []
+
+    @staticmethod
+    def _merge_artifact_ids(existing: list[str], new_ids: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for artifact_id in list(existing) + list(new_ids):
+            key = str(artifact_id)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(key)
+        return merged
+
+    @staticmethod
+    def _remember_artifacts(
+        conversation: ConversationSession,
+        artifacts: list[Any],
+        latest_artifact: Any,
+    ) -> None:
+        metadata = dict(conversation.metadata or {})
+        metadata["artifact_ids"] = [item.artifact_id for item in artifacts]
+        metadata["active_artifact_ids"] = [item.artifact_id for item in artifacts]
+        if latest_artifact is not None:
+            metadata["last_artifact_id"] = latest_artifact.artifact_id
+        conversation.metadata = metadata

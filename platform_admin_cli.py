@@ -4,12 +4,15 @@ import argparse
 import json
 from typing import Any
 
+from rag.mcp.discovery import MCPDiscoveryService
+from rag.mcp.schemas import MCPServerProfile
+from rag.mcp.session import MCPSessionManager
 from rag.platform.repositories import PlatformRepository
 from rag.platform.schemas import ChatProfile, KnowledgeBaseProfile, LLMProfile, UserProfile
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manage platform profiles for the RAG pipeline.")
+    parser = argparse.ArgumentParser(description="Manage AstraRAG platform profiles.")
     parser.add_argument("--platform-root", default="data/platform", help="Directory containing platform JSON config files.")
     subparsers = parser.add_subparsers(dest="resource", required=True)
 
@@ -62,6 +65,23 @@ def parse_args() -> argparse.Namespace:
     kbs_create.add_argument("--retrieval-mode", action="append", help="Retrieval mode. Can be repeated or comma-separated.")
     kbs_create.add_argument("--parser-id", default="legacy_json")
     kbs_create.add_argument("--status", default="ready")
+
+    mcps = subparsers.add_parser("mcps", help="Manage MCP server profiles.")
+    mcp_actions = mcps.add_subparsers(dest="action", required=True)
+    mcp_actions.add_parser("list", help="List MCP servers.")
+    mcp_tools = mcp_actions.add_parser("tools", help="List cached tools for an MCP server.")
+    mcp_tools.add_argument("--server", help="MCP server id. Omit to show all.")
+    mcp_create = mcp_actions.add_parser("create", help="Create or update an MCP server.")
+    mcp_create.add_argument("--server", required=True, help="MCP server id.")
+    mcp_create.add_argument("--name", help="Display name.")
+    mcp_create.add_argument("--transport", default="firecrawl", help="MCP transport/provider. First supported provider: firecrawl.")
+    mcp_create.add_argument("--url", default="https://api.firecrawl.dev/v2/search", help="Server URL or provider API URL.")
+    mcp_create.add_argument("--description", default="", help="Description.")
+    mcp_create.add_argument("--api-key-env", default="FIRECRAWL_API_KEY", help="Environment variable for the provider API key.")
+    mcp_create.add_argument("--disabled", action="store_true", help="Create the server disabled.")
+    mcp_refresh = mcp_actions.add_parser("refresh", help="Refresh MCP tool cache.")
+    mcp_refresh.add_argument("--server", required=True, help="MCP server id.")
+    mcp_refresh.add_argument("--timeout", type=float, default=10)
     return parser.parse_args()
 
 
@@ -205,6 +225,78 @@ def handle_kbs(args: argparse.Namespace, repository: PlatformRepository) -> None
     )
 
 
+def handle_mcps(args: argparse.Namespace, repository: PlatformRepository) -> None:
+    if args.action == "list":
+        print_json(
+            {
+                "mcp_servers": [server.to_dict() for server in repository.mcp_servers.all()],
+                "path": str(repository.mcp_servers.path),
+            }
+        )
+        return
+
+    if args.action == "tools":
+        servers = repository.mcp_servers.all()
+        if args.server:
+            servers = [server for server in servers if server.server_id == args.server]
+        print_json(
+            {
+                "tools": {
+                    server.server_id: [tool.to_dict() for tool in server.tool_specs()]
+                    for server in servers
+                },
+                "path": str(repository.mcp_servers.path),
+            }
+        )
+        return
+
+    if args.action == "create":
+        server = MCPServerProfile(
+            server_id=args.server,
+            name=args.name or args.server,
+            transport=args.transport,
+            url=args.url,
+            description=args.description,
+            enabled=not args.disabled,
+            headers={"Authorization": f"Bearer ${{{args.api_key_env}}}"},
+            variables={
+                "api_key_env": args.api_key_env,
+                "api_url": args.url,
+            },
+            metadata={"provider": args.transport},
+        )
+        repository.mcp_servers.upsert(server)
+        print_json(
+            {
+                "status": "ok",
+                "action": "mcps.create",
+                "mcp_server": server.to_dict(),
+                "path": str(repository.mcp_servers.path),
+            }
+        )
+        return
+
+    if args.action == "refresh":
+        server = repository.mcp_servers.get(args.server)
+        if not server:
+            raise ValueError(f"Unknown MCP server: {args.server}")
+        discovery = MCPDiscoveryService(MCPSessionManager())
+        updated = discovery.refresh_server(server, timeout=args.timeout)
+        repository.mcp_servers.upsert(updated)
+        print_json(
+            {
+                "status": "ok",
+                "action": "mcps.refresh",
+                "mcp_server": updated.to_dict(),
+                "tools": [tool.to_dict() for tool in updated.tool_specs()],
+                "path": str(repository.mcp_servers.path),
+            }
+        )
+        return
+
+    raise ValueError(f"Unsupported mcps action: {args.action}")
+
+
 def main() -> None:
     args = parse_args()
     repository = repo_from_args(args)
@@ -213,6 +305,7 @@ def main() -> None:
         "llms": handle_llms,
         "chats": handle_chats,
         "kbs": handle_kbs,
+        "mcps": handle_mcps,
     }
     handlers[args.resource](args, repository)
 

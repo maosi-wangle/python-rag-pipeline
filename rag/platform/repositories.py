@@ -12,6 +12,8 @@ from .schemas import (
     TraceRecord,
     UserProfile,
 )
+from ..mcp.schemas import MCPServerProfile
+from ..input.schemas import InputArtifact
 
 T = TypeVar("T")
 
@@ -40,6 +42,14 @@ class JsonRepository(Generic[T]):
             if str(item.get(self.id_field)) == item_id:
                 return self.factory(item)
         return None
+
+    def get_many(self, item_ids: list[str]) -> list[T]:
+        wanted = {str(item) for item in item_ids}
+        return [
+            self.factory(item)
+            for item in self._read_items()
+            if str(item.get(self.id_field)) in wanted
+        ]
 
     def upsert(self, item: T) -> None:
         payload = self.serializer(item)
@@ -155,6 +165,41 @@ class PlatformRepository:
             serializer=lambda item: item.to_dict(),
             defaults=[],
         )
+        self.artifacts = JsonRepository(
+            self.root / "artifacts.json",
+            id_field="artifact_id",
+            factory=InputArtifact.from_dict,
+            serializer=lambda item: item.to_dict(),
+            defaults=[],
+        )
+        self.mcp_servers = JsonRepository(
+            self.root / "mcp_servers.json",
+            id_field="server_id",
+            factory=MCPServerProfile.from_dict,
+            serializer=lambda item: item.to_dict(),
+            defaults=[
+                {
+                    "server_id": "firecrawl",
+                    "name": "Firecrawl Web Search",
+                    "transport": "firecrawl",
+                    "url": "https://api.firecrawl.dev/v2/search",
+                    "description": "Web search provider for fallback retrieval.",
+                    "enabled": True,
+                    "headers": {
+                        "Authorization": "Bearer ${FIRECRAWL_API_KEY}",
+                    },
+                    "variables": {
+                        "api_key_env": "FIRECRAWL_API_KEY",
+                        "api_url": "https://api.firecrawl.dev/v2/search",
+                    },
+                    "tool_cache": [],
+                    "metadata": {
+                        "provider": "firecrawl",
+                        "category": "web_search",
+                    },
+                }
+            ],
+        )
         self.traces = TraceRepository(self.root / "traces")
 
     def ensure_defaults(self) -> None:
@@ -165,6 +210,8 @@ class PlatformRepository:
             self.knowledge_bases,
             self.chat_profiles,
             self.conversations,
+            self.artifacts,
+            self.mcp_servers,
         ):
             if not repo.path.exists():
                 repo._write_items(repo._read_items())

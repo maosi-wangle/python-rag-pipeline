@@ -1,4 +1,6 @@
-# Agentic Modular RAG
+# AstraRAG
+
+Agentic RAG platform with multimodal input, conversation memory, profile-based knowledge-base switching, and MCP tool integration.
 
 这个项目现在的主架构已经切到“单主 agent + tool-calling loop”模式。
 
